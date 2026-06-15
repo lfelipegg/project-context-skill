@@ -82,6 +82,32 @@ read_max_chars_default = 4000
 read_max_chars_hard = 12000
 """
 
+SEMANTIC_ALIASES = {
+    "auth": ["authentication", "authenticate", "login", "signin", "sign-in", "session", "password"],
+    "authentication": ["auth", "authenticate", "login", "signin", "sign-in", "session", "password"],
+    "login": ["auth", "authentication", "authenticate", "signin", "sign-in", "session", "password"],
+    "signin": ["auth", "authentication", "login", "session"],
+    "billing": ["payment", "payments", "invoice", "invoices", "subscription", "subscriptions", "plan", "plans", "charge", "charges"],
+    "invoice": ["billing", "payment", "payments", "subscription", "charge"],
+    "invoices": ["billing", "payment", "payments", "subscription", "charges"],
+    "payment": ["billing", "invoice", "invoices", "subscription", "charge"],
+    "payments": ["billing", "invoice", "invoices", "subscription", "charges"],
+    "subscription": ["billing", "payment", "payments", "invoice", "plan"],
+    "subscriptions": ["billing", "payment", "payments", "invoices", "plans"],
+}
+
+SECRET_PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)\b\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{16,}['\"]?"),
+]
+
+
+class ConfigError(RuntimeError):
+    pass
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS meta (
@@ -138,16 +164,124 @@ def find_repo_root(start: Path | None = None) -> Path:
     return current
 
 
+def strip_toml_comment(line: str) -> str:
+    quote = ""
+    escaped = False
+    for idx, ch in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+            continue
+        if ch == "#":
+            return line[:idx]
+    return line
+
+
+def parse_toml_scalar(value: str, line_no: int) -> Any:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    raise ConfigError(f"invalid config line {line_no}: unsupported value {value!r}")
+
+
+def parse_toml_array(value: str, lines: list[str], index: int, line_no: int) -> tuple[list[Any], int]:
+    raw = value.strip()
+    items: list[Any] = []
+    if raw == "[":
+        index += 1
+        while index < len(lines):
+            item_line = strip_toml_comment(lines[index]).strip()
+            if not item_line:
+                index += 1
+                continue
+            if item_line == "]":
+                return items, index
+            if item_line.endswith(","):
+                item_line = item_line[:-1].strip()
+            items.append(parse_toml_scalar(item_line, index + 1))
+            index += 1
+        raise ConfigError(f"invalid config line {line_no}: unterminated array")
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return [], index
+        for part in inner.split(","):
+            part = part.strip()
+            if part:
+                items.append(parse_toml_scalar(part, line_no))
+        return items, index
+    raise ConfigError(f"invalid config line {line_no}: malformed array")
+
+
+def parse_simple_toml(text: str) -> dict[str, Any]:
+    """Parse the generated config shape on Python versions without tomllib."""
+    data: dict[str, Any] = {}
+    current = data
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line_no = index + 1
+        stripped = strip_toml_comment(lines[index]).strip()
+        if not stripped:
+            index += 1
+            continue
+        if stripped.startswith("["):
+            if not stripped.endswith("]") or stripped.count("[") != 1 or stripped.count("]") != 1:
+                raise ConfigError(f"invalid config line {line_no}: malformed section")
+            section = stripped[1:-1].strip()
+            if not section or "." in section:
+                raise ConfigError(f"invalid config line {line_no}: unsupported section {section!r}")
+            current = data.setdefault(section, {})
+            if not isinstance(current, dict):
+                raise ConfigError(f"invalid config line {line_no}: section conflicts with value")
+            index += 1
+            continue
+        if "=" not in stripped:
+            raise ConfigError(f"invalid config line {line_no}: expected key = value")
+        key, raw_value = stripped.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ConfigError(f"invalid config line {line_no}: empty key")
+        raw_value = raw_value.strip()
+        if raw_value.startswith("["):
+            value, index = parse_toml_array(raw_value, lines, index, line_no)
+        else:
+            value = parse_toml_scalar(raw_value, line_no)
+        current[key] = value
+        index += 1
+    return data
+
+
 def load_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
         import tomllib  # Python 3.11+
-
+    except ImportError:
+        try:
+            return parse_simple_toml(path.read_text(encoding="utf-8"))
+        except ConfigError as exc:
+            raise ConfigError(f"invalid config {path}: {exc}") from exc
+        except Exception as exc:
+            raise ConfigError(f"invalid config {path}: {exc}") from exc
+    try:
         with path.open("rb") as fh:
             return tomllib.load(fh)
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise ConfigError(f"invalid config {path}: {exc}") from exc
 
 
 def config(root: Path) -> dict[str, Any]:
@@ -263,6 +397,15 @@ def file_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
+def redact_secret_like_content(text: str) -> tuple[str, int]:
+    redactions = 0
+    redacted = text
+    for pattern in SECRET_PATTERNS:
+        redacted, count = pattern.subn("[REDACTED_SECRET]", redacted)
+        redactions += count
+    return redacted, redactions
+
+
 def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
@@ -371,14 +514,17 @@ def delete_document(con: sqlite3.Connection, document_id: int) -> None:
 
 def ingest_file(con: sqlite3.Connection, root: Path, path: Path, cfg: dict[str, Any], force: bool = False) -> tuple[str, int]:
     rel = rel_posix(root, path)
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    digest = file_hash(text)
+    raw_text = path.read_text(encoding="utf-8", errors="ignore")
+    text, redactions = redact_secret_like_content(raw_text)
+    digest = file_hash(raw_text)
     old = con.execute("SELECT id, hash FROM documents WHERE path = ?", (rel,)).fetchone()
-    if old and old["hash"] == digest and not force:
+    if old and old["hash"] == digest and not force and not redactions:
         count = con.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ?", (old["id"],)).fetchone()[0]
         return "unchanged", int(count)
     if old:
         delete_document(con, int(old["id"]))
+    if redactions:
+        print(f"warning: redacted {redactions} secret-like value(s) while indexing {rel}", file=sys.stderr)
     title = extract_title(path, text)
     ts = now_iso()
     updated_at = _dt.datetime.fromtimestamp(path.stat().st_mtime, _dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -447,38 +593,110 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
-def sanitize_fts(query: str) -> str:
+def tokenize_query(query: str) -> list[str]:
     terms = re.findall(r"[A-Za-z0-9_]{2,}", query.lower())
     seen: list[str] = []
     for term in terms:
         if term not in seen:
             seen.append(term)
-    return " OR ".join(f"{term}*" for term in seen[:10])
+    return seen
+
+
+def expand_query_terms(terms: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for term in terms:
+        candidates = [term, *SEMANTIC_ALIASES.get(term, [])]
+        for candidate in candidates:
+            for token in tokenize_query(candidate):
+                if token not in expanded:
+                    expanded.append(token)
+    return expanded[:18]
+
+
+def fts_query(terms: list[str], operator: str) -> str:
+    clean = [term for term in terms if re.fullmatch(r"[A-Za-z0-9_]{2,}", term)]
+    return f" {operator} ".join(f"{term}*" for term in clean[:18])
+
+
+def row_text(row: sqlite3.Row, key: str) -> str:
+    value = row[key]
+    return str(value or "").lower()
+
+
+def term_score(terms: list[str], row: sqlite3.Row, path_weight: int, title_weight: int, body_weight: int) -> int:
+    score = 0
+    path = row_text(row, "path")
+    title = row_text(row, "title")
+    heading = row_text(row, "heading")
+    summary = row_text(row, "summary")
+    content = row_text(row, "content")
+    for term in terms:
+        if term in path:
+            score += path_weight
+        if term in title:
+            score += title_weight
+        if term in heading:
+            score += max(title_weight - 4, 1)
+        if term in summary:
+            score += body_weight * 2
+        if term in content:
+            score += body_weight
+    return score
+
+
+def rank_search_rows(rows: list[sqlite3.Row], original_terms: list[str], expanded_terms: list[str], limit: int) -> list[sqlite3.Row]:
+    semantic_terms = [term for term in expanded_terms if term not in original_terms]
+
+    def key(row: sqlite3.Row) -> tuple[float, float, str, int]:
+        score = term_score(original_terms, row, 40, 34, 6)
+        score += term_score(semantic_terms, row, 24, 20, 3)
+        if row_text(row, "kind") == "agents-root":
+            score -= 18
+        if row_text(row, "path").startswith("docs/"):
+            score += 5
+        bm25_score = float(row["score"] or 0)
+        return (-score, bm25_score, row_text(row, "path"), int(row["id"]))
+
+    deduped = {int(row["id"]): row for row in rows}
+    return sorted(deduped.values(), key=key)[:limit]
 
 
 def search_rows(con: sqlite3.Connection, query: str, limit: int) -> list[sqlite3.Row]:
-    fts_query = sanitize_fts(query)
-    if fts_query:
+    original_terms = tokenize_query(query)[:8]
+    expanded_terms = expand_query_terms(original_terms)
+
+    def fetch_fts(match_query: str, candidate_limit: int) -> list[sqlite3.Row]:
+        if not match_query:
+            return []
         try:
-            rows = list(
+            return list(
                 con.execute(
                     """
                     SELECT c.id, c.title, c.path, c.heading, c.summary, c.updated_at, c.tokens_estimate,
+                           c.content, d.kind,
                            bm25(chunks_fts) AS score
                     FROM chunks_fts
                     JOIN chunks c ON c.id = chunks_fts.chunk_id
+                    JOIN documents d ON d.id = c.document_id
                     WHERE chunks_fts MATCH ?
                     ORDER BY score
                     LIMIT ?
                     """,
-                    (fts_query, limit),
+                    (match_query, candidate_limit),
                 )
             )
-            if rows:
-                return rows
         except sqlite3.OperationalError:
-            pass
-    words = re.findall(r"[A-Za-z0-9_]{2,}", query.lower())[:6]
+            return []
+
+    candidate_limit = max(limit * 8, 30)
+    rows: list[sqlite3.Row] = []
+    if len(original_terms) > 1:
+        rows.extend(fetch_fts(fts_query(original_terms, "AND"), candidate_limit))
+    rows.extend(fetch_fts(fts_query(expanded_terms, "OR"), candidate_limit))
+    if rows:
+        return rank_search_rows(rows, original_terms, expanded_terms, limit)
+
+    words = expanded_terms[:10]
     if not words:
         return []
     clauses = []
@@ -487,14 +705,16 @@ def search_rows(con: sqlite3.Connection, query: str, limit: int) -> list[sqlite3
         clauses.append("lower(c.title || ' ' || c.path || ' ' || ifnull(c.heading,'') || ' ' || ifnull(c.summary,'') || ' ' || c.content) LIKE ?")
         params.append(f"%{word}%")
     sql = f"""
-        SELECT c.id, c.title, c.path, c.heading, c.summary, c.updated_at, c.tokens_estimate, 0 AS score
+        SELECT c.id, c.title, c.path, c.heading, c.summary, c.updated_at, c.tokens_estimate,
+               c.content, d.kind, 0 AS score
         FROM chunks c
+        JOIN documents d ON d.id = c.document_id
         WHERE {' OR '.join(clauses)}
         ORDER BY c.updated_at DESC, c.id ASC
         LIMIT ?
     """
-    params.append(limit)
-    return list(con.execute(sql, params))
+    params.append(candidate_limit)
+    return rank_search_rows(list(con.execute(sql, params)), original_terms, expanded_terms, limit)
 
 
 def row_to_search_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -619,8 +839,9 @@ def db_counts(con: sqlite3.Connection) -> dict[str, Any]:
     return counts
 
 
-def stale_count(root: Path, con: sqlite3.Connection, cfg: dict[str, Any]) -> tuple[int, int]:
+def freshness_counts(root: Path, con: sqlite3.Connection, cfg: dict[str, Any]) -> tuple[int, int, int]:
     sources = discover_sources(root, cfg)
+    source_rels = {rel_posix(root, p) for p in sources}
     stale = 0
     for p in sources:
         rel = rel_posix(root, p)
@@ -628,7 +849,9 @@ def stale_count(root: Path, con: sqlite3.Connection, cfg: dict[str, Any]) -> tup
         text = p.read_text(encoding="utf-8", errors="ignore")
         if not row or row["hash"] != file_hash(text):
             stale += 1
-    return stale, len(sources)
+    indexed_rels = {row["path"] for row in con.execute("SELECT path FROM documents")}
+    orphaned = len(indexed_rels - source_rels)
+    return stale, len(sources), orphaned
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -636,7 +859,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     cfg = config(root)
     with connect(root) as con:
         counts = db_counts(con)
-        stale, source_total = stale_count(root, con, cfg)
+        stale, source_total, orphaned = freshness_counts(root, con, cfg)
     data = {
         "repo": str(root),
         "db_path": str(db_path(root, cfg)),
@@ -644,6 +867,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "chunks": counts["chunks"],
         "source_files": source_total,
         "stale_or_missing_sources": stale,
+        "orphaned_indexed_documents": orphaned,
         "fts5": counts["fts5"],
         "last_ingest": counts["last_ingest"],
     }
@@ -652,11 +876,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     else:
         for key, value in data.items():
             print(f"{key}: {value}")
-        if stale:
+        if stale or orphaned:
             print("status: stale; run `python .codex-context/ctx.py ingest`")
         else:
             print("status: fresh")
-    return 0 if not stale else 2
+    return 0 if not stale and not orphaned else 2
 
 
 def cmd_recent(args: argparse.Namespace) -> int:
@@ -700,7 +924,6 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     root = find_repo_root(Path(args.repo) if args.repo else None)
-    ensure_project_files(root)
     cfg = config(root)
     problems: list[str] = []
     agents = root / "AGENTS.md"
@@ -714,15 +937,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         problems.append("missing .codex-context/config.toml")
     if not (root / ".codex-context" / "ctx.py").exists():
         problems.append("missing .codex-context/ctx.py")
+    if not (root / "docs" / "agents" / "context.md").exists():
+        problems.append("missing docs/agents/context.md")
     with connect(root) as con:
         counts = db_counts(con)
-        stale, source_total = stale_count(root, con, cfg)
+        stale, source_total, orphaned = freshness_counts(root, con, cfg)
     print(f"repo: {root}")
     print(f"db: {db_path(root, cfg)}")
     print(f"documents: {counts['documents']} | chunks: {counts['chunks']} | source_files: {source_total}")
     print(f"fts5: {counts['fts5']} | last_ingest: {counts['last_ingest']}")
     if stale:
         problems.append(f"{stale} source files are stale or missing from index")
+    if orphaned:
+        problems.append(f"{orphaned} indexed documents no longer match configured sources")
     if problems:
         print("problems:")
         for problem in problems:

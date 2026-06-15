@@ -1,6 +1,6 @@
 ---
 name: project-context
-description: Use to set up or use token-efficient project context retrievalS patch an existing AGENTS.md, create SQLite-backed Markdown indexing, write documentation rules, and retrieve small context slices instead of scanning large docs.
+description: Use to set up or use token-efficient project context retrieval, patch an existing AGENTS.md, create SQLite-backed Markdown indexing, write documentation rules, and retrieve small context slices instead of scanning large docs.
 ---
 
 # Project Context
@@ -39,6 +39,7 @@ Actions:
    `python .codex-context/ctx.py ingest`
 8. Verify with:
    `python .codex-context/ctx.py doctor`
+   `python .codex-context/ctx.py search "project context" --limit 3`
 
 Do not replace the whole `AGENTS.md`. Only insert or refresh the marked project-context section.
 
@@ -212,6 +213,8 @@ python .codex-context/ctx.py doctor
 ```
 
 Search output must stay compact. It should show only ID, title or heading, path, updated date, and summary. Full content should appear only from `read` and only within the requested character limit.
+
+The CLI is standard-library only and supports Python 3.9+. It uses `tomllib` on Python 3.11+ and a small built-in parser for the generated config shape on Python 3.9 and 3.10.
 
 ## Setup Quality Gates
 

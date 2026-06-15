@@ -19,133 +19,17 @@ from pathlib import Path
 START = "<!-- project-context:start -->"
 END = "<!-- project-context:end -->"
 
-AGENTS_SECTION = """## Project Context Retrieval
-
-<!-- project-context:start -->
-This repo uses token-efficient project context retrieval.
-
-Use the user-level `$project-context` Skill before broad documentation scans or when a task depends on architecture, prior decisions, task history, database conventions, deployment behavior, auth/security/billing behavior, or non-obvious project behavior.
-
-Do not use it for trivial single-file edits.
-
-Preferred commands:
-
-- `python .codex-context/ctx.py status`
-- `python .codex-context/ctx.py search "<query>" --limit 8`
-- `python .codex-context/ctx.py read <id> --max-chars 4000`
-- `python .codex-context/ctx.py related <id> --limit 5`
-- `python .codex-context/ctx.py ingest` after meaningful Markdown doc changes
-
-Rules:
-
-- Search first; read only directly relevant IDs.
-- Never dump whole SQLite tables, full indexes, or every Markdown file.
-- Treat Markdown files as the source of truth and SQLite as the retrieval index.
-- If the index is missing or stale, rebuild it or fall back to targeted repo inspection.
-<!-- project-context:end -->
-"""
-
-CONFIG = """version = 1
-
-db_path = ".codex-context/context.sqlite"
-
-[sources]
-include = [
-  "README.md",
-  "AGENTS.md",
-  "docs/**/*.md",
-  "docs/**/*.mdx",
-  "agents/**/*.md",
-  ".codex-context/notes/**/*.md"
-]
-exclude = [
-  ".git/**",
-  ".worktrees/**",
-  "node_modules/**",
-  "vendor/**",
-  "dist/**",
-  "build/**",
-  ".next/**",
-  "coverage/**",
-  ".venv/**",
-  "venv/**",
-  "**/.env*",
-  "**/*secret*",
-  "**/*credential*",
-  "**/*private-key*"
-]
-
-[chunking]
-target_chars = 3500
-max_chars = 5500
-
-[output]
-search_limit_default = 8
-read_max_chars_default = 4000
-read_max_chars_hard = 12000
-"""
-
-README = """# Codex Context
-
-Purpose: project-local SQLite-backed context retrieval for Codex.
-
-The Markdown files remain the source of truth. The SQLite database is a generated index used to search first and read only bounded chunks by ID.
-
-## Commands
-
-```bash
-python .codex-context/ctx.py status
-python .codex-context/ctx.py ingest
-python .codex-context/ctx.py search "query" --limit 8
-python .codex-context/ctx.py read <id> --max-chars 4000
-python .codex-context/ctx.py related <id> --limit 5
-python .codex-context/ctx.py doctor
-```
-
-## Files
-
-- `ctx.py`: project-local context CLI.
-- `config.toml`: include/exclude patterns and limits.
-- `context.sqlite`: generated index; usually keep out of git.
-- `notes/`: optional Markdown notes to index.
-
-## Token Discipline
-
-Search first. Read only directly relevant IDs. Do not dump whole tables or large docs.
-"""
-
-DOCS_CONTEXT = """# Project Context Documentation
-
-Purpose: explain how this repo keeps Codex context token-efficient.
-Read when: setting up context retrieval, reorganizing docs, or deciding where durable project knowledge belongs.
-Do not read for: trivial source edits that do not need repository history or architecture context.
-Source of truth: `AGENTS.md`, `.codex-context/config.toml`, and current repository files.
-Last reviewed: update when the context system changes.
-
-## Summary
-
-- `AGENTS.md` should stay short and route Codex to focused docs or `$project-context`.
-- Markdown files are the human-readable source of truth.
-- `.codex-context/context.sqlite` is a generated retrieval index.
-- Codex should search the index first and read only relevant chunks by ID.
-- Re-run `python .codex-context/ctx.py ingest` after meaningful Markdown changes.
-
-## Documentation Shape
-
-Substantial docs should start with purpose, read-when guidance, source-of-truth notes, and a short summary. Use stable headings and one topic per section so the index returns useful chunks.
-
-## What To Keep Out Of AGENTS.md
-
-Keep long architecture history, migration detail, task logs, troubleshooting catalogs, and large examples in focused docs instead of the root agent guide.
-
-## What To Keep Out Of The Index
-
-Do not index secrets, `.env` files, credentials, dependency folders, build artifacts, coverage output, or generated logs.
-"""
-
 
 def skill_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def read_reference(name: str) -> str:
+    return (skill_root() / "references" / name).read_text(encoding="utf-8")
+
+
+def agents_section() -> str:
+    return read_reference("AGENTS-snippet.md").strip() + "\n"
 
 
 def write_file(path: Path, content: str, overwrite: bool, dry_run: bool, changed: list[str]) -> None:
@@ -162,9 +46,54 @@ def write_file(path: Path, content: str, overwrite: bool, dry_run: bool, changed
     changed.append(str(path))
 
 
+def insertion_index(text: str) -> int:
+    insert_at = len(text)
+    for marker in ["## Final Response", "## Response", "## Output", "## Quality Gates"]:
+        idx = text.find(marker)
+        if idx != -1:
+            insert_at = idx
+            break
+    return insert_at
+
+
+def remove_existing_project_context(text: str) -> tuple[str, int | None]:
+    """Remove valid or malformed project-context marked sections before repair."""
+    lines = text.splitlines(keepends=True)
+    output: list[str] = []
+    removed_at: int | None = None
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        is_heading = stripped == "## Project Context Retrieval"
+        heading_has_nearby_marker = is_heading and any(START in line or END in line for line in lines[i : i + 8])
+        starts_section = START in lines[i] or heading_has_nearby_marker
+        stray_end = END in lines[i]
+        if starts_section or stray_end:
+            if removed_at is None:
+                removed_at = sum(len(line) for line in output)
+            if stray_end and not starts_section:
+                i += 1
+                continue
+            i += 1
+            found_end = END in lines[i - 1]
+            while i < len(lines):
+                if END in lines[i]:
+                    i += 1
+                    found_end = True
+                    break
+                if not found_end and lines[i].startswith("## "):
+                    break
+                i += 1
+            continue
+        output.append(lines[i])
+        i += 1
+    return "".join(output), removed_at
+
+
 def patch_agents(path: Path, dry_run: bool, changed: list[str]) -> None:
+    section = agents_section()
     if not path.exists():
-        new_text = "# Repository Instructions\n\n" + AGENTS_SECTION.strip() + "\n"
+        new_text = "# Repository Instructions\n\n" + section
         if dry_run:
             changed.append(f"would create {path}")
             return
@@ -173,23 +102,15 @@ def patch_agents(path: Path, dry_run: bool, changed: list[str]) -> None:
         return
 
     text = path.read_text(encoding="utf-8", errors="ignore")
-    if START in text and END in text:
-        before = text.split(START, 1)[0]
-        after = text.split(END, 1)[1]
-        marked_body = AGENTS_SECTION.split(START, 1)[1].split(END, 1)[0]
-        new_text = before.rstrip() + "\n\n" + START + marked_body + END + after
+    cleaned, removed_at = remove_existing_project_context(text)
+    insert_at = removed_at if removed_at is not None else insertion_index(cleaned)
+    prefix = cleaned[:insert_at].rstrip()
+    suffix = cleaned[insert_at:].lstrip()
+    new_text = prefix + "\n\n" + section.strip() + "\n"
+    if suffix:
+        new_text += "\n" + suffix
     else:
-        insert_at = len(text)
-        for marker in ["## Final Response", "## Response", "## Output", "## Quality Gates"]:
-            idx = text.find(marker)
-            if idx != -1:
-                insert_at = idx
-                break
-        prefix = text[:insert_at].rstrip()
-        suffix = text[insert_at:].lstrip()
-        new_text = prefix + "\n\n" + AGENTS_SECTION.strip() + "\n\n" + suffix
-        if not suffix:
-            new_text = new_text.rstrip() + "\n"
+        new_text = new_text.rstrip() + "\n"
     if new_text == text:
         return
     if dry_run:
@@ -253,9 +174,27 @@ def main() -> int:
         print(f"Repo path does not exist: {repo}", file=sys.stderr)
         return 1
 
-    write_file(repo / ".codex-context" / "config.toml", CONFIG, args.overwrite_docs, args.dry_run, changed)
-    write_file(repo / ".codex-context" / "README.md", README, args.overwrite_docs, args.dry_run, changed)
-    write_file(repo / "docs" / "agents" / "context.md", DOCS_CONTEXT, args.overwrite_docs, args.dry_run, changed)
+    write_file(
+        repo / ".codex-context" / "config.toml",
+        read_reference("config-template.toml"),
+        args.overwrite_docs,
+        args.dry_run,
+        changed,
+    )
+    write_file(
+        repo / ".codex-context" / "README.md",
+        read_reference("context-readme.md"),
+        args.overwrite_docs,
+        args.dry_run,
+        changed,
+    )
+    write_file(
+        repo / "docs" / "agents" / "context.md",
+        read_reference("documentation-guide.md"),
+        args.overwrite_docs,
+        args.dry_run,
+        changed,
+    )
     if not args.dry_run:
         (repo / ".codex-context" / "notes").mkdir(parents=True, exist_ok=True)
     copy_ctx(repo, args.dry_run, changed)
@@ -271,9 +210,16 @@ def main() -> int:
 
     init_code = run_ctx(repo, ["init"])
     ingest_code = 0
+    doctor_code = 0
+    search_code = 0
     if not args.no_ingest:
         ingest_code = run_ctx(repo, ["ingest"])
-    doctor_code = run_ctx(repo, ["doctor"])
+        if not ingest_code:
+            doctor_code = run_ctx(repo, ["doctor"])
+        if not ingest_code and not doctor_code:
+            search_code = run_ctx(repo, ["search", "project context", "--limit", "3"])
+    else:
+        print("Skipped ingest and doctor because --no-ingest was set; run ingest then doctor when ready.")
 
     print("\nChanged files:")
     if changed:
@@ -282,7 +228,7 @@ def main() -> int:
     else:
         print("- none")
 
-    if init_code or ingest_code or doctor_code:
+    if init_code or ingest_code or doctor_code or search_code:
         return 1
     return 0
 

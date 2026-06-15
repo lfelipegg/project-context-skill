@@ -30,22 +30,24 @@ Markdown remains the source of truth. `.codex-context/context.sqlite` is a gener
 
 Install the skill itself into your agent's skills directory. You can copy the folder, or symlink it if you want edits to this checkout to take effect in place.
 
-To symlink instead of copying, replace `cp -R` in the examples below with `ln -s`.
+Set `SKILL_SOURCE` to the path where this skill checkout lives. To symlink instead of copying, replace `cp -R` in the examples below with `ln -s`.
 
 ### Codex
 
 For a user-level Codex skill available in all repositories:
 
 ```bash
+SKILL_SOURCE="/path/to/project-context"
 mkdir -p "$HOME/.agents/skills"
-cp -R /home/mothmanex/.codex/skills/project-context "$HOME/.agents/skills/project-context"
+cp -R "$SKILL_SOURCE" "$HOME/.agents/skills/project-context"
 ```
 
 For a repo-level Codex skill shared with a project:
 
 ```bash
+SKILL_SOURCE="/path/to/project-context"
 mkdir -p "$REPO_ROOT/.agents/skills"
-cp -R /home/mothmanex/.codex/skills/project-context "$REPO_ROOT/.agents/skills/project-context"
+cp -R "$SKILL_SOURCE" "$REPO_ROOT/.agents/skills/project-context"
 ```
 
 Invoke it explicitly with `$project-context`, or let Codex invoke it implicitly when a task matches the skill description.
@@ -55,15 +57,17 @@ Invoke it explicitly with `$project-context`, or let Codex invoke it implicitly 
 For a personal Claude Code skill available in all projects:
 
 ```bash
+SKILL_SOURCE="/path/to/project-context"
 mkdir -p "$HOME/.claude/skills"
-cp -R /home/mothmanex/.codex/skills/project-context "$HOME/.claude/skills/project-context"
+cp -R "$SKILL_SOURCE" "$HOME/.claude/skills/project-context"
 ```
 
 For a project Claude Code skill:
 
 ```bash
+SKILL_SOURCE="/path/to/project-context"
 mkdir -p "$REPO_ROOT/.claude/skills"
-cp -R /home/mothmanex/.codex/skills/project-context "$REPO_ROOT/.claude/skills/project-context"
+cp -R "$SKILL_SOURCE" "$REPO_ROOT/.claude/skills/project-context"
 ```
 
 Invoke it with `/project-context`. Claude Code uses the skill directory name as the command name.
@@ -83,7 +87,11 @@ Useful options:
 - `--no-ingest`: set up files without indexing Markdown immediately.
 - `--no-gitignore`: skip adding generated SQLite index patterns to `.gitignore`.
 
-After setup, the script initializes the database, ingests Markdown unless `--no-ingest` is set, and runs `doctor`.
+After setup, the script initializes the database. Unless `--no-ingest` is set, it also ingests Markdown, runs `doctor`, and runs `search "project context" --limit 3` as a retrieval quality gate.
+
+## Python Compatibility
+
+The generated CLI supports Python 3.9+. On Python 3.11+, config parsing uses standard-library `tomllib`. On Python 3.9 and 3.10, the CLI uses a small built-in parser for the generated config shape.
 
 ## Use The Context CLI
 
