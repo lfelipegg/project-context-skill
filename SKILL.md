@@ -1,6 +1,6 @@
 ---
 name: project-context
-description: Use to set up or use token-efficient project context retrieval: patch an existing AGENTS.md, create SQLite-backed Markdown indexing, write documentation rules, and retrieve small context slices instead of scanning large docs.
+description: Use to set up or use token-efficient project context retrievalS patch an existing AGENTS.md, create SQLite-backed Markdown indexing, write documentation rules, and retrieve small context slices instead of scanning large docs.
 ---
 
 # Project Context
@@ -151,6 +151,7 @@ Insert or refresh this exact section in `AGENTS.md` during setup mode:
 ## Project Context Retrieval
 
 <!-- project-context:start -->
+
 This repo uses token-efficient project context retrieval.
 
 Use the user-level `$project-context` Skill before broad documentation scans or when a task depends on architecture, prior decisions, task history, database conventions, deployment behavior, auth/security/billing behavior, or non-obvious project behavior.
